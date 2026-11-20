@@ -1,0 +1,1019 @@
+diff --git a/FilmClub/FilmWorker.h b/FilmClub/FilmWorker.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..62a96ead19e5774e053940f303af23755841e5a8
+--- /dev/null
++++ b/FilmClub/FilmWorker.h
+@@ -0,0 +1,23 @@
++#pragma once
++#include <windows.h>
++#include <cwchar>
++#include <string>
++
++inline std::wstring filmName(const wchar_t* part, DWORD child) {
++    return L"Local\\CoAFilm-" + std::to_wstring(child) + L"-" + part;
++}
++inline HANDLE filmLifetime = nullptr;
++inline bool filmOpenLifetime(const wchar_t* args) {
++    // The owner creates this event before launch and signals it even on an immediate close.
++    const wchar_t* value = args ? wcsstr(args, L"--lifetime ") : nullptr;
++    if (!value) return false;
++    value += 11;
++    std::wstring suffix(value, wcscspn(value, L" \t"));
++    if (suffix.empty() || suffix.size() > 64 || suffix.find_first_not_of(L"0123456789-") != suffix.npos)
++        return false;
++    filmLifetime = OpenEventW(SYNCHRONIZE, FALSE, (L"Local\\CoAFilm-Life-" + suffix).c_str());
++    return filmLifetime && WaitForSingleObject(filmLifetime, 0) == WAIT_TIMEOUT;
++}
++inline bool filmStopping() {
++    return WaitForSingleObject(filmLifetime, 0) != WAIT_TIMEOUT;
++}
+diff --git a/FilmClub/plex-party.patch b/FilmClub/plex-party.patch
+new file mode 100644
+index 0000000000000000000000000000000000000000..58f2db15a90c0a53bbb5bc1fa2507236549f7f73
+--- /dev/null
++++ b/FilmClub/plex-party.patch
+@@ -0,0 +1,113 @@
++--- a/PartyClient.hpp
+++++ b/PartyClient.hpp
++@@ -109,12 +109,10 @@
++         std::mutex binaryInMutex_;
++         std::deque<std::vector<uint8_t>> binaryEvents_;
++ 
++-        std::mutex socketMutex_;
++-        HINTERNET socket_ = nullptr;
++         std::atomic<bool> desiredConnected_{false};
++         std::atomic<uint32_t> reconnectCount_{0};
++-        std::jthread worker_;
++         std::string clientId_;
++         int64_t lastPingSentMs_ = 0;
+++        std::jthread worker_;
++     };
++ }
++--- a/PartyClient.cpp
+++++ b/PartyClient.cpp
++@@ -98,14 +98,6 @@
++     void PartyClient::Disconnect()
++     {
++         desiredConnected_.store(false);
++-        HINTERNET socket = nullptr;
++-        {
++-            std::lock_guard lock(socketMutex_);
++-            socket = socket_;
++-        }
++-        if (socket)
++-            WinHttpWebSocketClose(socket, WINHTTP_WEB_SOCKET_SUCCESS_CLOSE_STATUS,
++-                                  nullptr, 0);
++         SetState(PartyConnectionState::Disconnected);
++         outgoingChanged_.notify_all();
++     }
++@@ -276,6 +268,7 @@
++         std::lock_guard lock(binaryOutMutex_);
++         pendingFrame_.assign(data.begin(), data.end());
++         hasPendingFrame_ = true;
+++        outgoingChanged_.notify_one();
++     }
++ 
++     void PartyClient::Queue(PartyWireMessage message)
++@@ -483,10 +476,6 @@
++                 continue;
++             }
++ 
++-            {
++-                std::lock_guard lock(socketMutex_);
++-                socket_ = socket;
++-            }
++             SetState(PartyConnectionState::Connected);
++ 
++             PartyWireMessage hello = BaseMessage(PartyMessageType::Hello);
++@@ -513,20 +502,34 @@
++                 SendNow(socket, rejoin);
++             }
++ 
++-            bool connected = true;
++-            while (connected && desiredConnected_.load() && !stop.stop_requested())
++-            {
++-                if (!FlushOutgoing(socket)) break;
++-                FlushBinary(socket);
++-                const int64_t now = NowMs();
++-                if (now - lastPingSentMs_ >= 5000)
+++            // A synchronous receive can sleep for an idle room's entire lifetime.
+++            // WinHTTP permits one sender alongside one receiver on this handle.
+++            std::jthread sender([this, socket](std::stop_token done) {
+++                while (!done.stop_requested() && desiredConnected_.load())
++                 {
++-                    PartyWireMessage ping = BaseMessage(PartyMessageType::Ping);
++-                    ping.sentAtMs = now;
++-                    if (!SendNow(socket, ping)) break;
++-                    lastPingSentMs_ = now;
+++                    if (!FlushOutgoing(socket)) break;
+++                    FlushBinary(socket);
+++                    const int64_t now = NowMs();
+++                    if (now - lastPingSentMs_ >= 5000) {
+++                        auto ping = BaseMessage(PartyMessageType::Ping);
+++                        ping.sentAtMs = now;
+++                        if (!SendNow(socket, ping)) break;
+++                        lastPingSentMs_ = now;
+++                    }
+++                    std::unique_lock lock(outgoingMutex_);
+++                    auto delay = std::chrono::milliseconds(std::clamp<int64_t>(lastPingSentMs_ + 5000 - NowMs(), 1, 5000));
+++                    outgoingChanged_.wait_for(lock, done, delay, [this] {
+++                        if (!desiredConnected_.load() || !outgoing_.empty()) return true;
+++                        std::lock_guard binaryLock(binaryOutMutex_);
+++                        return hasPendingFrame_;
+++                    });
++                 }
++-
+++                if (!done.stop_requested())
+++                    WinHttpWebSocketShutdown(socket, WINHTTP_WEB_SOCKET_SUCCESS_CLOSE_STATUS, nullptr, 0);
+++            });
+++
+++            while (desiredConnected_.load() && !stop.stop_requested())
+++            {
++                 std::string text;
++                 std::vector<uint8_t> binary;
++                 bool isBinary = false;
++@@ -553,10 +556,9 @@
++                 PushEvent(std::move(incoming));
++             }
++ 
++-            {
++-                std::lock_guard lock(socketMutex_);
++-                socket_ = nullptr;
++-            }
+++            sender.request_stop();
+++            outgoingChanged_.notify_all();
+++            sender.join();
++             WinHttpWebSocketClose(socket, WINHTTP_WEB_SOCKET_SUCCESS_CLOSE_STATUS, nullptr, 0);
++             WinHttpCloseHandle(socket);
++             if (connection) WinHttpCloseHandle(connection);
+diff --git a/FilmClub/prepare-workers.py b/FilmClub/prepare-workers.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..36eaff3e5997c70a47351724ea9a05e55abeae74
+--- /dev/null
++++ b/FilmClub/prepare-workers.py
+@@ -0,0 +1,63 @@
++"""Prepare source-isolated x64 helpers from the matching AzerothPlex and Stonewall TV trees."""
++from pathlib import Path
++import shutil
++import subprocess
++import sys
++
++root = Path(__file__).resolve().parent
++if len(sys.argv)!=4:
++    raise SystemExit("Usage: python FilmClub/prepare-workers.py PLEX_CHECKOUT CINEMA_CHECKOUT EMPTY_BUILD_DIR")
++plex, cinema, build = [Path(s).resolve() for s in sys.argv[1:]]
++if build.exists() and any(build.iterdir()):
++    raise SystemExit("Use an empty build directory.")
++build.mkdir(parents=True,exist_ok=True)
++ui = build / "protocol"
++ui.mkdir(parents=True, exist_ok=True)
++
++def replace(path, original, new):
++    source = path.read_text(encoding="utf-8-sig")
++    if source.count(original) != 1:
++        raise ValueError(f"Unexpected source in {path}: {original!r}")
++    path.write_text(source.replace(original, new), encoding="utf-8")
++
++for mode, upstream in [("Plex", plex), ("Cinema", cinema)]:
++    source = build / "workers" / mode
++    shutil.copytree(upstream / "host", source, dirs_exist_ok=True)
++    for notice in ("LICENSE", "THIRD_PARTY_NOTICES.md", "MODIFICATIONS.md"):
++        shutil.copy2(upstream / notice, source / notice)
++    header = source / "VideoShared.hpp"
++    shared = header.read_text(encoding="utf-8-sig")
++    # Keep the original data layouts. Each reader opens only its own child's names.
++    (ui / (mode + "Protocol.h")).write_text(
++        shared.replace("namespace wxl_video_shared", "namespace CoAFilm" + mode), encoding="utf-8")
++    for file in [source / "VideoHost.cpp"] + ([source / "FramePublisher.cpp"] if mode == "Plex" else []):
++        content = file.read_text(encoding="utf-8-sig")
++        for symbol, suffix in [("kMappingName", "Frames"), ("kControlMappingName", "Control"), ("kUiMappingName", "Ui")]:
++            content = content.replace("wxl_video_shared::" + symbol + ");",
++                'filmName(L"' + suffix + '", GetCurrentProcessId()).c_str());')
++        file.write_text('#include "FilmWorker.h"\n' + content, encoding="utf-8")
++    host = source / "VideoHost.cpp"
++    replace(host, "const DWORD parentPid = ParseParentPid(commandLine);",
++            "if (!filmOpenLifetime(commandLine)) return 8;\n    const DWORD parentPid = ParseParentPid(commandLine);")
++    replace(host, "case WM_TIMER:", "case WM_TIMER:\n            if (filmStopping()) { PostMessageW(window, WM_CLOSE, 0, 0); return 0; }")
++    replace(host, 'L"WarcraftXL" /', 'L"CoAFilmClub" /')
++    replace(host, "g_lastCommandSequence = commandSequence;",
++            "g_lastCommandSequence = commandSequence;\n                InterlockedExchange(&control->command, 0);")
++    if mode == "Plex":
++        replace(host, "g_lastUiCommandSequence = sequence;",
++                "g_lastUiCommandSequence = sequence;\n        InterlockedExchange(&bridge->command.command, 0);")
++    replace(host, "LocalDataDirectory()\n    {",
++            'LocalDataDirectory()\n    {\n        wchar_t profile[32768];\n'
++            '        DWORD n = GetEnvironmentVariableW(L"COAFILM_PROFILE_ROOT", profile, 32768);\n'
++            '        if (n && n < 32768 && std::filesystem::path(profile).is_absolute()) {\n'
++            '            auto path = std::filesystem::path(profile) / L"' + mode + '";\n'
++            '            std::error_code ec; std::filesystem::create_directories(path, ec);\n'
++            '            return ec ? std::wstring{} : path.wstring();\n        }')
++    shutil.copy2(root / "FilmWorker.h", source / "FilmWorker.h")
++    if mode == "Plex":
++        subprocess.run(["git","init","-q"],cwd=source,check=True)
++        subprocess.run(["git", "apply", "--no-index", str(root / "plex-party.patch")], cwd=source, check=True)
++    if mode == "Cinema":
++        replace(source / "CMakeLists.txt", "/x86/WebView2LoaderStatic.lib", "/x64/WebView2LoaderStatic.lib")
++        shutil.copy2(upstream / "player.html", source / "player.html")
++
+diff --git a/WoW/Source/Ui/Film/FilmClub.cpp b/WoW/Source/Ui/Film/FilmClub.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..4431aab2d8f02ad68cde6922420b33395b496e51
+--- /dev/null
++++ b/WoW/Source/Ui/Film/FilmClub.cpp
+@@ -0,0 +1,131 @@
++#include "FilmClub.h"
++#include "FilmTransport.h"
++#include "FilmSurface.h"
++#include "Engine/Source/FrameScript/FrameScript.h"
++#include "Engine/Source/lua-5.1/src/lua.h"
++#include "WoW/Source/Ui/GameUI.h"
++#include "WoW/Source/Ui/WorldFrame.h"
++#include "WoW/Source/ObjectMgrClient/ObjectMgrClient.h"
++#include <cmath>
++#include <memory>
++
++namespace {
++using namespace CoAFilm;
++Session session;
++Surface surface;
++float aspect = 16.f/9.f;
++ULONGLONG nextAspect = 0;
++bool placed = false;
++uint32_t mapId = 0;
++C3Vector center, right;
++std::string screenMessage;
++
++int action(lua_State* L) {
++    size_t n = 0;
++    const char* arg = lua_tolstring(L, 1, &n);
++    if (!arg || n > 32) return 0;
++    std::string cmd(arg, n);
++    const char* body = lua_tolstring(L, 2, &n);
++    if (body && n > 1023) { lua_pushboolean(L, 0); lua_pushstring(L,"Input is too long."); return 2; }
++    std::string text = body ? std::string(body, n) : "";
++    double number = lua_tonumber(L, 3);
++    int value = std::isfinite(number) && number >= 0 && number <= 100 ? int(number) : -1;
++    bool ok = false;
++    std::string message;
++    if (cmd == "cinema" || cmd == "plex") {
++        wchar_t path[32768];
++        DWORD count = GetModuleFileNameW(nullptr, path, static_cast<DWORD>(std::size(path)));
++        Player next = cmd == "plex" ? Player::Plex : Player::Cinema;
++        if (count && count < std::size(path)) {
++            bool changing = !session.live() || next != session.player;
++            ok = session.start(next, std::filesystem::path(path).parent_path());
++            if (ok && changing) { aspect=16.f/9.f; nextAspect=0; surface.reset(); screenMessage.clear(); }
++        }
++        message = session.status;
++    } else if (cmd == "close") {
++        FilmShutdown(); ok = true;
++    } else if (cmd == "hide") {
++        placed = false; surface.reset(); screenMessage.clear(); ok = true;
++    } else if (cmd == "place") {
++        if (CGGameUI::s_inWorld && CGWorldFrame::GetActiveCamera() && Surface::device()) {
++            C3Vector eye, dir;
++            CGWorldFrame::GetCameraPosition(&eye); CGWorldFrame::GetCameraFacing(&dir);
++            float horiz = std::hypot(dir.x, dir.y);
++            if (horiz > 0.02f) {
++                center = C3Vector(eye.x+dir.x*12, eye.y+dir.y*12, eye.z+dir.z*12);
++                right = C3Vector(dir.y/horiz, -dir.x/horiz, 0);
++                mapId = ClntObjMgrGetMapID(); placed = true; ok = true; screenMessage.clear();
++            }
++        }
++        if (!ok) message = "Place the screen in a D3D9 world view while looking toward the horizon.";
++    } else {
++        ok = session.control(cmd, text, value);
++        if (!ok) message = session.opened() ? "Player is starting, or this input is unavailable." : session.status;
++    }
++    lua_pushboolean(L, ok); lua_pushlstring(L, message.data(), message.size());
++    return 2;
++}
++void field(lua_State* L, const char* name, const char* value, size_t size) {
++    lua_pushlstring(L, value, strnlen_s(value, size));
++    lua_setfield(L, -2, name);
++}
++int state(lua_State* L) {
++    namespace P = CoAFilmPlex;
++    bool alive = session.live();
++    lua_newtable(L);
++    lua_pushstring(L, alive ? (session.player == Player::Plex ? "plex" : "cinema") : "closed");
++    lua_setfield(L,-2,"player");
++    lua_pushboolean(L, placed); lua_setfield(L,-2,"placed");
++    lua_pushstring(L, session.status.c_str()); lua_setfield(L,-2,"status");
++    lua_pushstring(L, screenMessage.c_str()); lua_setfield(L,-2,"screen");
++    if (!alive || session.player != Player::Plex) return 1;
++    static P::UiSnapshot snap;
++    if (!session.snapshot(snap)) return 1;
++    if (snap.status[0]) field(L,"status",snap.status,sizeof(snap.status));
++    field(L,"error",snap.error,sizeof(snap.error)); field(L,"room",snap.partyRoomCode,sizeof(snap.partyRoomCode));
++    field(L,"partyError",snap.partyError,sizeof(snap.partyError));
++    if (snap.cytube.active) field(L,"status",snap.cytube.status,sizeof(snap.cytube.status));
++    auto list = [&](const char* key, const auto& entries, unsigned count, auto getName) {
++        unsigned size = std::min<unsigned>(count, static_cast<unsigned>(std::size(entries)));
++        lua_createtable(L, size, 0);
++        for (unsigned i=0; i<size; ++i) {
++            const auto& name = getName(entries[i]);
++            lua_pushlstring(L,name,strnlen_s(name,sizeof(name)));
++            lua_rawseti(L,-2,i+1);
++        }
++        lua_setfield(L,-2,key);
++    };
++    list("server",snap.servers,snap.serverCount,[](const auto& e)->const auto& { return e.name; });
++    list("library",snap.sections,snap.sectionCount,[](const auto& e)->const auto& { return e.title; });
++    list("item",snap.items,snap.itemCount,[](const auto& e)->const auto& { return e.title; });
++    return 1;
++}
++}
++
++void FilmRegister() {
++    FrameScript_RegisterFunction("CoAFilmAction", action);
++    FrameScript_RegisterFunction("CoAFilmState", state);
++}
++void FilmInstallPanel() {
++    static const char panel[] =
++#include "FilmPanel.lua.inc"
++    ;
++    FrameScript_ExecuteBuffer(panel, sizeof(panel)-1, "CoAFilmClub", nullptr, nullptr);
++}
++void FilmShutdown() {
++    placed = false; surface.reset(); session.close(); screenMessage.clear();
++}
++void FilmDraw(const C3Vector& eye) {
++    if (!placed || !session.opened() || mapId != ClntObjMgrGetMapID()) return;
++    C3Vector relative(center.x-eye.x, center.y-eye.y, center.z-eye.z);
++    if (relative.x*relative.x+relative.y*relative.y+relative.z*relative.z > 160.f*160.f) return;
++    bool changed = session.frame();
++    if (session.pixels.empty()) { if (!session.opened()) surface.reset(); return; }
++    if (session.player == Player::Plex && GetTickCount64() >= nextAspect) {
++        static CoAFilmPlex::UiSnapshot snap;
++        nextAspect = GetTickCount64()+500;
++        if (session.snapshot(snap) && snap.videoAspectRatio >= 0.25f && snap.videoAspectRatio <= 5.f)
++            aspect = snap.videoAspectRatio;
++    }
++    screenMessage = surface.draw(session.pixels, session.width(), session.height(), changed, relative, right, aspect);
++}
+diff --git a/WoW/Source/Ui/Film/FilmClub.h b/WoW/Source/Ui/Film/FilmClub.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..0b035edcb002e47fc2eb59d6127ed11a2ba18b93
+--- /dev/null
++++ b/WoW/Source/Ui/Film/FilmClub.h
+@@ -0,0 +1,6 @@
++#pragma once
++class C3Vector;
++void FilmRegister();
++void FilmInstallPanel();
++void FilmDraw(const C3Vector& camera);
++void FilmShutdown();
+diff --git a/WoW/Source/Ui/Film/FilmPanel.lua.inc b/WoW/Source/Ui/Film/FilmPanel.lua.inc
+new file mode 100644
+index 0000000000000000000000000000000000000000..f3326aa6f9d736aa60338877df77b026128c29f1
+--- /dev/null
++++ b/WoW/Source/Ui/Film/FilmPanel.lua.inc
+@@ -0,0 +1,141 @@
++R"COAFILM(
++if not (SlashCmdList and CreateFrame and UIParent and CoAFilmAction) then return end
++local panel = CreateFrame("Frame", "CoAFilmClubPanel", UIParent)
++panel:SetSize(610, 446)
++panel:SetPoint("CENTER")
++panel:SetFrameStrata("DIALOG")
++panel:EnableMouse(true)
++panel:SetMovable(true)
++panel:RegisterForDrag("LeftButton")
++panel:SetScript("OnDragStart", panel.StartMoving)
++panel:SetScript("OnDragStop", panel.StopMovingOrSizing)
++panel:SetBackdrop({bgFile="Interface\\DialogFrame\\UI-DialogBox-Background",
++  edgeFile="Interface\\DialogFrame\\UI-DialogBox-Border", tile=true, tileSize=32, edgeSize=24,
++  insets={left=5,right=5,top=5,bottom=5}})
++panel:Hide()
++local function label(x,y,font)
++  local t=panel:CreateFontString(nil,"OVERLAY",font or "GameFontHighlight")
++  t:SetPoint("TOPLEFT",x,-y)
++  t:SetJustifyH("LEFT")
++  return t
++end
++label(18,14,"GameFontNormalLarge"):SetText("Film Club")
++local feedback=label(18,401,"GameFontHighlightSmall")
++feedback:SetWidth(570)
++local status=label(18,367)
++status:SetWidth(570)
++local function button(name,x,y,w,fn)
++  local b=CreateFrame("Button",nil,panel,"UIPanelButtonTemplate")
++  b:SetPoint("TOPLEFT",x,-y)
++  b:SetSize(w,23)
++  b:SetText(name)
++  b:SetScript("OnClick",fn)
++  return b
++end
++local entry=CreateFrame("EditBox",nil,panel,"InputBoxTemplate")
++entry:SetPoint("TOPLEFT",23,-78)
++entry:SetSize(416,25)
++entry:SetAutoFocus(false)
++entry:SetMaxLetters(1023)
++entry:SetScript("OnEscapePressed",function(self) self:ClearFocus() end)
++local function run(op,text,value)
++  local ok,msg=CoAFilmAction(op,text or "",value or 0)
++  feedback:SetText(msg and msg~="" and msg or (ok and "" or "Command unavailable."))
++  entry:ClearFocus()
++end
++local kind,offset="server",0
++local function pick(k) kind,offset=k,0 end
++button("Video Cinema",16,44,108,function() run("cinema") end)
++button("Azeroth Plex",128,44,108,function() pick("server") run("plex") end)
++button("Place screen",252,44,104,function() run("place") end)
++button("Hide screen",360,44,98,function() run("hide") end)
++button("End session",474,44,112,function() run("close") end)
++button("Hide panel",492,9,94,function() panel:Hide() end)
++local function submit()
++  local s=CoAFilmState()
++  if s.player=="plex" then pick("item") run("search",entry:GetText()) else run("load",entry:GetText()) end
++end
++entry:SetScript("OnEnterPressed",submit)
++local load=button("Load video",448,79,138,submit)
++button("Play",16,110,62,function() run("play") end)
++button("Pause",82,110,62,function() run("pause") end)
++button("Stop",148,110,62,function() run("stop") end)
++local vol=80
++local level=label(294,116)
++level:SetText("Volume 80%")
++local function volume(delta)
++  vol=math.max(0,math.min(100,vol+delta))
++  run("volume","",vol)
++  level:SetText("Volume "..vol.."%")
++end
++button("-",250,110,30,function() volume(-10) end)
++button("+",382,110,30,function() volume(10) end)
++local plex={}
++local function pb(...)
++  local b=button(...)
++  plex[#plex+1]=b
++  return b
++end
++pb("Sign in",16,149,74,function() run("login") end)
++pb("Servers",94,149,78,function() pick("server") end)
++pb("Libraries",176,149,78,function() pick("library") end)
++pb("Titles",258,149,68,function() pick("item") end)
++pb("Back",330,149,62,function() run("back") pick("item") end)
++pb("Prev page",398,149,92,function() run("prev") pick("item") end)
++pb("Next page",494,149,92,function() run("next") pick("item") end)
++local rows={}
++for i=1,5 do
++  local row=pb("",16,177+(i-1)*24,482,function(self)
++    if self.command then
++      run(self.command,"",self.index)
++      if self.command=="server" then pick("library") elseif self.command=="library" then pick("item") end
++    end
++  end)
++  rows[i]=row
++end
++pb("Up",506,177,80,function() offset=math.max(0,offset-5) end)
++pb("Down",506,201,80,function()
++  local list=CoAFilmState()[kind] or {}
++  if offset+5<#list then offset=offset+5 end
++end)
++pb("Create party",16,307,104,function() run("create") end)
++pb("Join code",124,307,92,function() run("join",entry:GetText()) end)
++pb("Leave party",220,307,98,function() run("leave") end)
++pb("Join CyTube",330,307,122,function() run("channel",entry:GetText()) end)
++pb("Leave channel",456,307,130,function() run("leavechannel") end)
++local hint=label(18,340,"GameFontHighlightSmall")
++local function refresh()
++  local s=CoAFilmState()
++  local isPlex=s.player=="plex"
++  for _,b in ipairs(plex) do if isPlex then b:Show() else b:Hide() end end
++  load:SetText(isPlex and "Search Plex" or "Load video")
++  hint:SetText(isPlex and "Enter a search, party code, or CyTube channel above." or
++    "Choose Video Cinema, enter a YouTube link, then use Load video and Place screen.")
++  local list=s[kind] or {}
++  if offset>=#list then offset=0 end
++  if isPlex then
++    for i,row in ipairs(rows) do
++      local index=i+offset
++      if list[index] then
++        row.command,row.index=kind,index
++        row:SetText(list[index]:gsub("|","||"))
++        row:Show()
++      else row.command=nil row:Hide() end
++    end
++  end
++  local detail=(s.error and s.error~="" and s.error) or (s.partyError and s.partyError~="" and s.partyError) or s.status or ""
++  if s.room and s.room~="" then detail=detail.."  Party "..s.room end
++  if s.screen and s.screen~="" then detail=detail.."  "..s.screen end
++  status:SetText(detail:gsub("|","||"))
++end
++local elapsed=0
++panel:SetScript("OnUpdate",function(_,dt)
++  elapsed=elapsed+dt
++  if elapsed>=0.35 then elapsed=0 refresh() end
++end)
++panel:SetScript("OnShow",refresh)
++SLASH_COAFILMCLUB1="/film"
++SlashCmdList.COAFILMCLUB=function()
++  if panel:IsShown() then panel:Hide() else panel:Show() end
++end
++)COAFILM"
+diff --git a/WoW/Source/Ui/Film/FilmQuad.cpp b/WoW/Source/Ui/Film/FilmQuad.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..7103cd2d4afe7771f91d7d56886ff3e1263ce1f6
+--- /dev/null
++++ b/WoW/Source/Ui/Film/FilmQuad.cpp
+@@ -0,0 +1,72 @@
++#include "FilmQuad.h"
++#include "FilmVertexBytecode.h"
++#include <wrl/client.h>
++using Microsoft::WRL::ComPtr;
++
++namespace CoAFilm {
++void QuadPipeline::reset() {
++    shader_.Reset(); declaration_.Reset(); owner_ = nullptr;
++}
++bool QuadPipeline::draw(IDirect3DDevice9* d, IDirect3DTexture9* texture,
++              const D3DMATRIX& projection, const Vertex (&v)[4]) {
++    if (!d || !texture) return false;
++    if (owner_ != d) {
++        reset();
++        const D3DVERTEXELEMENT9 elements[] = {
++            {0,0,D3DDECLTYPE_FLOAT4,D3DDECLMETHOD_DEFAULT,D3DDECLUSAGE_POSITION,0},
++            {0,16,D3DDECLTYPE_FLOAT2,D3DDECLMETHOD_DEFAULT,D3DDECLUSAGE_TEXCOORD,0}, D3DDECL_END()
++        };
++        if (FAILED(d->CreateVertexShader(reinterpret_cast<const DWORD*>(filmVertexBytecode), &shader_)) ||
++            FAILED(d->CreateVertexDeclaration(elements, &declaration_))) { reset(); return false; }
++        owner_ = d;
++    }
++    struct ClipVertex { float clip[4]; float u, v; } clip[4];
++    for (int i=0; i<4; ++i) {
++        for (int j=0; j<4; ++j)
++            clip[i].clip[j] = v[i].x*projection.m[0][j] + v[i].y*projection.m[1][j] +
++                              v[i].z*projection.m[2][j] + projection.m[3][j];
++        clip[i].u=v[i].u; clip[i].v=v[i].v;
++    }
++    ComPtr<IDirect3DStateBlock9> state;
++    ComPtr<IDirect3DVertexBuffer9> stream;
++    UINT offset, stride;
++    if (FAILED(d->CreateStateBlock(D3DSBT_ALL, &state)) || FAILED(state->Capture()) ||
++        FAILED(d->GetStreamSource(0, &stream, &offset, &stride))) return false;
++
++    bool ok = true;
++    auto check = [&](HRESULT hr) { if (FAILED(hr)) ok = false; };
++    check(d->SetVertexShader(shader_.Get())); check(d->SetPixelShader(nullptr));
++    check(d->SetVertexDeclaration(declaration_.Get()));
++    check(d->SetStreamSourceFreq(0, 1));
++    struct State { D3DRENDERSTATETYPE id; DWORD value; };
++    const State states[] = {
++        {D3DRS_ZENABLE,D3DZB_TRUE},{D3DRS_ZWRITEENABLE,TRUE},{D3DRS_ZFUNC,D3DCMP_LESSEQUAL},
++        {D3DRS_DEPTHBIAS,0},{D3DRS_SLOPESCALEDEPTHBIAS,0},{D3DRS_CULLMODE,D3DCULL_NONE},
++        {D3DRS_LIGHTING,FALSE},{D3DRS_FOGENABLE,FALSE},{D3DRS_STENCILENABLE,FALSE},
++        {D3DRS_ALPHABLENDENABLE,FALSE},{D3DRS_ALPHATESTENABLE,FALSE},{D3DRS_CLIPPLANEENABLE,0},
++        {D3DRS_CLIPPING,TRUE},{D3DRS_FILLMODE,D3DFILL_SOLID},{D3DRS_COLORWRITEENABLE,15},
++        {D3DRS_SRGBWRITEENABLE,FALSE},{D3DRS_VERTEXBLEND,D3DVBF_DISABLE},{D3DRS_INDEXEDVERTEXBLENDENABLE,FALSE}
++    };
++    for (auto s : states) check(d->SetRenderState(s.id, s.value));
++    check(d->SetTexture(0, texture));
++    check(d->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1));
++    check(d->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE));
++    check(d->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1));
++    check(d->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TFACTOR));
++    check(d->SetRenderState(D3DRS_TEXTUREFACTOR, 0xffffffff));
++    check(d->SetTextureStageState(0, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE));
++    check(d->SetTextureStageState(0, D3DTSS_TEXCOORDINDEX, 0));
++    check(d->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_DISABLE));
++    check(d->SetTextureStageState(1, D3DTSS_ALPHAOP, D3DTOP_DISABLE));
++    check(d->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR));
++    check(d->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR));
++    check(d->SetSamplerState(0, D3DSAMP_MIPFILTER, D3DTEXF_NONE));
++    check(d->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP));
++    check(d->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP));
++    check(d->SetSamplerState(0, D3DSAMP_SRGBTEXTURE, FALSE));
++    if (ok) check(d->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, clip, sizeof(ClipVertex)));
++    check(state->Apply());
++    check(d->SetStreamSource(0, stream.Get(), offset, stride));
++    return ok;
++}
++}
+diff --git a/WoW/Source/Ui/Film/FilmQuad.h b/WoW/Source/Ui/Film/FilmQuad.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..5c0f57fb3313e7af4e821938b923170aedeed855
+--- /dev/null
++++ b/WoW/Source/Ui/Film/FilmQuad.h
+@@ -0,0 +1,16 @@
++#pragma once
++#include <d3d9.h>
++#include <wrl/client.h>
++
++namespace CoAFilm {
++struct Vertex { float x, y, z, u, v; };
++class QuadPipeline {
++    IDirect3DDevice9* owner_ = nullptr;
++    Microsoft::WRL::ComPtr<IDirect3DVertexShader9> shader_;
++    Microsoft::WRL::ComPtr<IDirect3DVertexDeclaration9> declaration_;
++public:
++    void reset();
++    bool draw(IDirect3DDevice9* device, IDirect3DTexture9* texture,
++              const D3DMATRIX& viewProjection, const Vertex (&corners)[4]);
++};
++}
+diff --git a/WoW/Source/Ui/Film/FilmSurface.cpp b/WoW/Source/Ui/Film/FilmSurface.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..e5710f1e39561da4bedf97ed59135c4ef14c1888
+--- /dev/null
++++ b/WoW/Source/Ui/Film/FilmSurface.cpp
+@@ -0,0 +1,60 @@
++#include "FilmSurface.h"
++#include "Engine/Source/Gx/Gx.h"
++#include "Engine/Source/Gx/CGxDeviceD3d/CGxDeviceD3d.h"
++#include "Engine/Source/Gx/CGxDeviceD3d9Ex/CGxDeviceD3d9Ex.h"
++#include <cstring>
++
++namespace CoAFilm {
++void Surface::reset() {
++    pipeline_.reset();
++    if (texture_) GxTexDestroy(texture_);
++    texture_ = nullptr; pixels_ = nullptr;
++}
++IDirect3DDevice9* Surface::device() {
++    if (!g_theGxDevicePtr || !g_theGxDevicePtr->m_context) return nullptr;
++    switch (g_theGxDevicePtr->DeviceApi()) {
++    case GxApi_D3d9: return static_cast<CGxDeviceD3d*>(g_theGxDevicePtr)->m_d3dDevice;
++    case GxApi_D3d9Ex: return static_cast<CGxDeviceD3d9Ex*>(g_theGxDevicePtr)->m_d3dDevice;
++    default: return nullptr;
++    }
++}
++const char* Surface::draw(const std::vector<unsigned char>& pixels, unsigned w, unsigned h,
++                          bool changed, C3Vector p, C3Vector right, float aspect) {
++    auto* d = device();
++    if (!d || !w || !h || pixels.size() != size_t(w)*h*4) return "Waiting for a video frame.";
++    if (texture_ && (w != width_ || h != height_)) reset();
++    width_ = w; height_ = h; pixels_ = &pixels;
++    auto latch = [](EGxTexCommand cmd, uint32_t w, uint32_t h, uint32_t, uint32_t level, void* user,
++                    uint32_t& stride, const void*& data) {
++        const Surface& s = *static_cast<const Surface*>(user);
++        if (cmd==GxTex_Latch && !level && w==s.width_ && h==s.height_ && s.pixels_ &&
++            s.pixels_->size()==size_t(w)*h*4) { stride=w*4; data=s.pixels_->data(); }
++    };
++    if (!texture_ && !GxTexCreate(GxTex_NonPow2,w,h,1,GxTex_Argb8888,GxTex_Argb8888,
++            CGxTexFlags(GxTex_Linear),this,latch,"CoA Film Club",texture_))
++        return "The device could not create the film texture.";
++    if (changed || texture_->m_needsCreation || texture_->m_needsUpdate)
++        GxTexUpdate(texture_,0,0,w,h,1);
++    // D3D9Ex keeps a CPU copy until a texture first enters its hardware cache.
++    if (g_theGxDevicePtr->DeviceApi() == GxApi_D3d9Ex && texture_->m_apiSpecificData2) {
++        auto* ex = static_cast<CGxDeviceD3d9Ex*>(g_theGxDevicePtr);
++        if (!texture_->m_apiSpecificData) {
++            ex->ITexAcquire(texture_);
++            if (texture_->m_apiSpecificData) ex->ITexUploadAll(texture_);
++        }
++        if (texture_->m_apiSpecificData) ex->ITexTouch(texture_);
++    }
++    if (!texture_->m_apiSpecificData) return "Waiting for the film texture.";
++    C44Matrix view;
++    GxXformView(view);
++    C44Matrix combined = view * g_theGxDevicePtr->m_projNative;
++    D3DMATRIX projection;
++    static_assert(sizeof(combined) == sizeof(projection));
++    memcpy(&projection,&combined,sizeof(projection));
++    float rx = right.x*4, ry = right.y*4, rz = 4/aspect;
++    Vertex corners[] = {{p.x-rx,p.y-ry,p.z+rz,0,0},{p.x+rx,p.y+ry,p.z+rz,1,0},
++                        {p.x-rx,p.y-ry,p.z-rz,0,1},{p.x+rx,p.y+ry,p.z-rz,1,1}};
++    return pipeline_.draw(d,static_cast<IDirect3DTexture9*>(texture_->m_apiSpecificData),projection,corners)
++        ? "" : "World-screen draw unavailable.";
++}
++}
+diff --git a/WoW/Source/Ui/Film/FilmSurface.h b/WoW/Source/Ui/Film/FilmSurface.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..c173e60a9e301921356b7566210f13fe5892c4d9
+--- /dev/null
++++ b/WoW/Source/Ui/Film/FilmSurface.h
+@@ -0,0 +1,20 @@
++#pragma once
++#include "FilmQuad.h"
++#include "Engine/Source/Tempest/C3Vector.h"
++#include <cstdint>
++#include <vector>
++class CGxTex;
++
++namespace CoAFilm {
++class Surface {
++    CGxTex* texture_ = nullptr;
++    QuadPipeline pipeline_;
++    const std::vector<unsigned char>* pixels_ = nullptr;
++    unsigned width_ = 0, height_ = 0;
++public:
++    static IDirect3DDevice9* device();
++    void reset();
++    const char* draw(const std::vector<unsigned char>& pixels, unsigned w, unsigned h,
++                     bool changed, C3Vector relative, C3Vector right, float aspect);
++};
++}
+diff --git a/WoW/Source/Ui/Film/FilmTransport.cpp b/WoW/Source/Ui/Film/FilmTransport.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..61061b2cc553cf038ecc310abd337f560b323c6e
+--- /dev/null
++++ b/WoW/Source/Ui/Film/FilmTransport.cpp
+@@ -0,0 +1,171 @@
++#include "FilmTransport.h"
++#include <algorithm>
++#include <cstring>
++
++namespace CoAFilm {
++namespace P = CoAFilmPlex;
++namespace C = CoAFilmCinema;
++static_assert(sizeof(P::FrameHeader) == sizeof(C::FrameHeader));
++void View::reset() {
++    if (view_) UnmapViewOfFile(view_);
++    view_ = nullptr;
++}
++void* View::open(DWORD pid, const wchar_t* part, DWORD access, size_t bytes) {
++    if (view_) return view_;
++    std::wstring name = L"Local\\CoAFilm-" + std::to_wstring(pid) + L"-" + part;
++    HANDLE mapping = OpenFileMappingW(access, FALSE, name.c_str());
++    if (mapping) {
++        view_ = MapViewOfFile(mapping, access, 0, 0, bytes);
++        CloseHandle(mapping);
++    }
++    return view_;
++}
++void Session::close() {
++    if (lifetime_) { SetEvent(lifetime_); CloseHandle(lifetime_); }
++    if (process_) CloseHandle(process_);
++    lifetime_ = process_ = nullptr;
++    pid_ = 0;
++    sequence_ = 0;
++    frames_.reset(); controls_.reset(); ui_.reset();
++    std::vector<unsigned char>().swap(pixels);
++    std::vector<unsigned char>().swap(scratch_);
++    status = "Player closed.";
++}
++bool Session::live() {
++    if (!process_) return false;
++    if (WaitForSingleObject(process_, 0) == WAIT_TIMEOUT) return true;
++    DWORD code = 0;
++    GetExitCodeProcess(process_, &code);
++    close();
++    status = "Helper exited (code " + std::to_string(code) + ").";
++    return false;
++}
++bool Session::start(Player next, const std::filesystem::path& dir) {
++    if (live() && next == player) return true;
++    auto folder = dir / L"Media" / (next == Player::Plex ? L"Plex" : L"Cinema");
++    auto path = folder / L"wxl-video-host.exe";
++    if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) {
++        status = "Missing media helper beside this client.";
++        return false;
++    }
++    // Open the successor before releasing the previous session.
++    static unsigned serial = 0;
++    auto suffix = std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(++serial);
++    HANDLE life = CreateEventW(nullptr, TRUE, FALSE, (L"Local\\CoAFilm-Life-" + suffix).c_str());
++    if (!life || GetLastError() == ERROR_ALREADY_EXISTS) {
++        if (life) CloseHandle(life);
++        status = "Could not reserve a playback session."; return false;
++    }
++    std::wstring args = L"\"" + path.wstring() + L"\" --background --parent-pid " +
++        std::to_wstring(GetCurrentProcessId()) + L" --lifetime " + suffix;
++    STARTUPINFOW startup{sizeof(startup)};
++    PROCESS_INFORMATION pi{};
++    if (!CreateProcessW(path.c_str(), args.data(), nullptr, nullptr, FALSE, 0, nullptr,
++                        folder.c_str(), &startup, &pi)) {
++        DWORD error = GetLastError();
++        CloseHandle(life); status = "Helper launch failed (" + std::to_string(error) + ").";
++        return false;
++    }
++    CloseHandle(pi.hThread);
++    close();
++    lifetime_ = life; process_ = pi.hProcess; pid_ = pi.dwProcessId; player = next;
++    status = "Starting player.";
++    return true;
++}
++bool Session::attach() {
++    if (!live()) return false;
++    const size_t frameBytes = size_t(width()) * height() * 4;
++    auto* h = static_cast<const C::FrameHeader*>(frames_.open(pid_, L"Frames", FILE_MAP_READ,
++        sizeof(C::FrameHeader) + 2 * frameBytes));
++    if (!h || h->hostPid != static_cast<LONG>(pid_)) return false;
++    if (h->magic != C::kMagic || h->version != C::kVersion || h->headerBytes != sizeof(*h) ||
++        h->width != width() || h->height != height() || h->stride != width()*4 || h->frameBytes != frameBytes) {
++        status = "Incompatible helper frame layout."; return false;
++    }
++    if (status == "Starting player.") status = "Player connected.";
++    return true;
++}
++bool Session::frame() {
++    if (!attach()) return false;
++    size_t bytes = size_t(width()) * height() * 4;
++    auto* h = static_cast<const C::FrameHeader*>(frames_.open(pid_, L"Frames", FILE_MAP_READ, sizeof(C::FrameHeader) + 2*bytes));
++    LONG next = h->sequence;
++    MemoryBarrier();
++    LONG slot = h->activeIndex;
++    if (!h->ready || next <= 0 || next == sequence_ || slot < 0 || slot > 1 || h->slotSequence[slot] != next) return false;
++    MemoryBarrier();
++    scratch_.resize(bytes);
++    memcpy(scratch_.data(), reinterpret_cast<const unsigned char*>(h) + sizeof(*h) + bytes*slot, bytes);
++    MemoryBarrier();
++    if (!h->ready || h->slotSequence[slot] != next || h->hostPid != static_cast<LONG>(pid_)) return false;
++    pixels.swap(scratch_);
++    sequence_ = next;
++    return true;
++}
++bool Session::snapshot(P::UiSnapshot& snap) {
++    if (player != Player::Plex || !attach()) return false;
++    auto* ui = static_cast<const P::UiBridge*>(ui_.open(pid_, L"Ui", FILE_MAP_READ | FILE_MAP_WRITE, sizeof(P::UiBridge)));
++    return P::ReadUiSnapshot(ui, snap);
++}
++
++template<class Block>
++static bool valid(const Block* b) {
++    return b && b->magic == C::kControlMagic && b->version == C::kControlVersion && b->structBytes == sizeof(*b);
++}
++bool Session::control(const std::string& cmd, const std::string& text, int value) {
++    if (!attach()) return false;
++    constexpr DWORD rw = FILE_MAP_READ | FILE_MAP_WRITE;
++    if (cmd == "volume") {
++        if (value < 0 || value > 100) return false;
++        auto volume = [value](auto* b) {
++            if (!valid(b)) return false;
++            InterlockedExchange(&b->volumePercent, value);
++            InterlockedIncrement(&b->volumeSequence);
++            return true;
++        };
++        if (player == Player::Cinema)
++            return volume(static_cast<C::ControlBlock*>(controls_.open(pid_, L"Control", rw, sizeof(C::ControlBlock))));
++        return volume(static_cast<P::ControlBlock*>(controls_.open(pid_, L"Control", rw, sizeof(P::ControlBlock))));
++    }
++    if (player == Player::Cinema) {
++        auto* b = static_cast<C::ControlBlock*>(controls_.open(pid_, L"Control", rw, sizeof(C::ControlBlock)));
++        if (!valid(b) || InterlockedCompareExchange(&b->command, 0, 0) != 0) return false;
++        C::Command op;
++        if (cmd == "load") {
++            if (text.empty() || text.size() >= sizeof(b->url) || text.find('\0') != text.npos) return false;
++            op = C::Command::LoadAndPlay;
++        } else if (cmd == "play") op = C::Command::Play;
++        else if (cmd == "pause") op = C::Command::Pause;
++        else if (cmd == "stop") op = C::Command::Stop;
++        else return false;
++        if (cmd == "load") memcpy(b->url, text.c_str(), text.size()+1);
++        InterlockedExchange(&b->command, static_cast<LONG>(op));
++        InterlockedIncrement(&b->commandSequence);
++        return true;
++    }
++    auto* ui = static_cast<P::UiBridge*>(ui_.open(pid_, L"Ui", rw, sizeof(P::UiBridge)));
++    if (!ui || ui->magic != P::kUiMagic || ui->version != P::kUiVersion || ui->structBytes != sizeof(*ui)) return false;
++    if (InterlockedCompareExchange(&ui->command.command, 0, 0) != 0) return false;
++    struct Op { const char* name; P::UiCommand id; };
++    static const Op ops[] = {
++        {"login",P::UiCommand::StartLogin}, {"server",P::UiCommand::SelectServer}, {"library",P::UiCommand::SelectSection},
++        {"item",P::UiCommand::SelectItem}, {"search",P::UiCommand::Search}, {"play",P::UiCommand::Play},
++        {"pause",P::UiCommand::Pause}, {"stop",P::UiCommand::Stop}, {"next",P::UiCommand::NextPage},
++        {"prev",P::UiCommand::PreviousPage}, {"back",P::UiCommand::NavigateBack}, {"create",P::UiCommand::CreateParty},
++        {"join",P::UiCommand::JoinParty}, {"leave",P::UiCommand::LeaveParty}, {"channel",P::UiCommand::JoinCytube},
++        {"leavechannel",P::UiCommand::LeaveCytube}
++    };
++    for (auto op : ops) if (cmd == op.name) {
++        P::UiCommandPacket packet{};
++        if (text.size() >= sizeof(packet.text) || text.find('\0') != text.npos) return false;
++        packet.command = static_cast<LONG>(op.id);
++        packet.index = value - 1; // Panel rows start at one.
++        memcpy(packet.text, text.c_str(), text.size()+1);
++        ui->command = packet;
++        MemoryBarrier();
++        InterlockedIncrement(&ui->commandSequence);
++        return true;
++    }
++    return false;
++}
++}
+diff --git a/WoW/Source/Ui/Film/FilmTransport.h b/WoW/Source/Ui/Film/FilmTransport.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..04fa82d615386782a16441dbb0cde6cdbe32b3b5
+--- /dev/null
++++ b/WoW/Source/Ui/Film/FilmTransport.h
+@@ -0,0 +1,43 @@
++#pragma once
++#include "CinemaProtocol.h"
++#include "PlexProtocol.h"
++#include <filesystem>
++#include <string>
++#include <vector>
++
++namespace CoAFilm {
++enum class Player { Cinema, Plex };
++class View {
++    void* view_ = nullptr;
++public:
++    ~View() { reset(); }
++    void reset();
++    void* open(DWORD pid, const wchar_t* name, DWORD access, size_t bytes);
++};
++class Session {
++    View frames_, controls_, ui_;
++    HANDLE process_ = nullptr;
++    HANDLE lifetime_ = nullptr;
++    DWORD pid_ = 0;
++    LONG sequence_ = 0;
++    std::vector<unsigned char> scratch_;
++    bool attach();
++public:
++    Session() = default;
++    Session(const Session&) = delete;
++    Session& operator=(const Session&) = delete;
++    ~Session() { close(); }
++    Player player = Player::Cinema;
++    std::string status = "Player closed.";
++    std::vector<unsigned char> pixels;
++    unsigned width() const { return player == Player::Plex ? CoAFilmPlex::kWidth : CoAFilmCinema::kWidth; }
++    unsigned height() const { return player == Player::Plex ? CoAFilmPlex::kHeight : CoAFilmCinema::kHeight; }
++    bool opened() const { return process_ != nullptr; }
++    bool start(Player next, const std::filesystem::path& clientDirectory);
++    bool live();
++    void close();
++    bool frame();
++    bool control(const std::string& command, const std::string& text, int value);
++    bool snapshot(CoAFilmPlex::UiSnapshot& snap);
++};
++}
+diff --git a/WoW/Source/Ui/Film/FilmVertex.hlsl b/WoW/Source/Ui/Film/FilmVertex.hlsl
+new file mode 100644
+index 0000000000000000000000000000000000000000..e99ea7de132e31ef1c5b867970b95774d3ef888c
+--- /dev/null
++++ b/WoW/Source/Ui/Film/FilmVertex.hlsl
+@@ -0,0 +1,6 @@
++struct VertexOut { float4 pos : POSITION; float2 uv : TEXCOORD0; };
++VertexOut main(float4 pos : POSITION, float2 uv : TEXCOORD0) {
++    VertexOut o;
++    o.pos = pos; o.uv = uv;
++    return o;
++}
+diff --git a/WoW/Source/Ui/Film/FilmVertexBytecode.h b/WoW/Source/Ui/Film/FilmVertexBytecode.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..e918e09dff20333ecd2e8f022c233527154dc63e
+--- /dev/null
++++ b/WoW/Source/Ui/Film/FilmVertexBytecode.h
+@@ -0,0 +1,39 @@
++#if 0
++//
++// Generated by Microsoft (R) HLSL Shader Compiler 10.1
++    vs_2_0
++    dcl_position v0
++    dcl_texcoord v1
++    mov oPos, v0
++    mov oT0.xy, v1
++
++// approximately 2 instruction slots used
++#endif
++
++const BYTE filmVertexBytecode[] =
++{
++      0,   2, 254, 255, 254, 255,
++     20,   0,  67,  84,  65,  66,
++     28,   0,   0,   0,  35,   0,
++      0,   0,   0,   2, 254, 255,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0, 129,   0,   0,
++     28,   0,   0,   0, 118, 115,
++     95,  50,  95,  48,   0,  77,
++    105,  99, 114, 111, 115, 111,
++    102, 116,  32,  40,  82,  41,
++     32,  72,  76,  83,  76,  32,
++     83, 104,  97, 100, 101, 114,
++     32,  67, 111, 109, 112, 105,
++    108, 101, 114,  32,  49,  48,
++     46,  49,   0, 171,  31,   0,
++      0,   2,   0,   0,   0, 128,
++      0,   0,  15, 144,  31,   0,
++      0,   2,   5,   0,   0, 128,
++      1,   0,  15, 144,   1,   0,
++      0,   2,   0,   0,  15, 192,
++      0,   0, 228, 144,   1,   0,
++      0,   2,   0,   0,   3, 224,
++      1,   0, 228, 144, 255, 255,
++      0,   0
++};
+diff --git a/WoW/Source/Ui/GameUI.cpp b/WoW/Source/Ui/GameUI.cpp
+index ea8b238d5b9cb4a1856f2d2b299113da54d653ae..22e061b65b8696b93173c2cf1e04fce0eaf4180d 100644
+--- a/WoW/Source/Ui/GameUI.cpp
++++ b/WoW/Source/Ui/GameUI.cpp
+@@ -1,0 +2 @@
++#include "Film/FilmClub.h"
+@@ -2084,0 +2086 @@
++    FilmInstallPanel();
+@@ -7774,0 +7777 @@
++    FilmShutdown();
+@@ -8424,0 +8428 @@
++    FilmShutdown();
+diff --git a/WoW/Source/Ui/GameUI_Scripts.cpp b/WoW/Source/Ui/GameUI_Scripts.cpp
+index c1b7e03bafaaa52fd1f335dcbe96216150c572d2..5ec432d26c397c049cf1f14c556be95db832f577 100644
+--- a/WoW/Source/Ui/GameUI_Scripts.cpp
++++ b/WoW/Source/Ui/GameUI_Scripts.cpp
+@@ -1,0 +2 @@
++#include "Film/FilmClub.h"
+@@ -6550,0 +6552 @@
++    FilmRegister();
+@@ -6618,0 +6621,2 @@
++    FrameScript_UnregisterFunction("CoAFilmAction");
++    FrameScript_UnregisterFunction("CoAFilmState");
+diff --git a/WoW/Source/Ui/WorldFrame.cpp b/WoW/Source/Ui/WorldFrame.cpp
+index e02fdc20b53e634acc483eee13765de2aff11c4e..29b976ab5215246191f184d6888b6ff1117a5f9d 100644
+--- a/WoW/Source/Ui/WorldFrame.cpp
++++ b/WoW/Source/Ui/WorldFrame.cpp
+@@ -1,0 +2 @@
++#include "Film/FilmClub.h"
+@@ -1754,0 +1756 @@
++    FilmDraw(this->m_camera->m_position);
